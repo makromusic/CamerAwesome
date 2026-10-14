@@ -33,6 +33,7 @@ import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
+import com.google.common.util.concurrent.ListenableFuture
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.FlutterPlugin.FlutterPluginBinding
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
@@ -45,6 +46,7 @@ import kotlinx.coroutines.*
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
@@ -65,6 +67,7 @@ class CameraAwesomeX : CameraInterface, FlutterPlugin, ActivityAware {
     private val sensorOrientationListener: SensorOrientationListener = SensorOrientationListener()
 
     private lateinit var cameraState: CameraXState
+    private var pendingCameraProvider: ListenableFuture<ProcessCameraProvider>? = null
     private val cameraPermissions = CameraPermissions()
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private var exifPreferences = ExifPreferences(false)
@@ -142,42 +145,57 @@ class CameraAwesomeX : CameraInterface, FlutterPlugin, ActivityAware {
             activity!!.stopService(Intent(activity!!, PlayerService::class.java))
         }
 
-        val cameraProvider = getCameraProvider()
-
-        val mode = CaptureModes.valueOf(captureMode)
-        cameraState = CameraXState(cameraProvider = cameraProvider,
-            textureEntries = sensors.mapIndexed { index: Int, pigeonSensor: PigeonSensor ->
-                (pigeonSensor.deviceId
-                    ?: index.toString()) to textureRegistry!!.createSurfaceTexture()
-            }.toMap(),
-            sensors = sensors,
-            mirrorFrontCamera = mirrorFrontCamera,
-            currentCaptureMode = mode,
-            enableImageStream = enableImageStream,
-            videoOptions = videoOptions?.android,
-            videoRecordingQuality = videoOptions?.quality,
-            onStreamReady = { state -> state.updateLifecycle(activity!!) }).apply {
-            this.updateAspectRatio(aspectRatio)
-            this.flashMode = FlashMode.valueOf(flashMode)
-            this.enableAudioRecording = videoOptions?.enableAudio ?: true
-        }
-        this.exifPreferences = exifPreferences
-        orientationStreamListener =
-            OrientationStreamListener(activity!!, listOf(sensorOrientationListener, cameraState))
-        imageStreamChannel.setStreamHandler(cameraState)
-        if (mode != CaptureModes.ANALYSIS_ONLY) {
-            cameraState.updateLifecycle(activity!!)
-            // Zoom should be set after updateLifeCycle
-            if (zoom > 0) {
-                // TODO Find a better way to set initial zoom than using a postDelayed
-                Handler(Looper.getMainLooper()).postDelayed({
-                    (cameraState.concurrentCamera?.cameras?.firstOrNull()
-                        ?: cameraState.previewCamera)?.cameraControl?.setLinearZoom(zoom.toFloat())
-                }, 200)
+        configureCameraXLogs()
+        // Blocking on this future froze the main thread until CameraX finished initialising (ANR).
+        val future = ProcessCameraProvider.getInstance(activity!!)
+        pendingCameraProvider = future
+        future.addListener({
+            if (pendingCameraProvider !== future) {
+                callback(Result.failure(CancellationException("Camera stopped before setup finished")))
+                return@addListener
             }
-        }
+            pendingCameraProvider = null
+            try {
+                val cameraProvider = future.get()
 
-        callback(Result.success(true))
+                val mode = CaptureModes.valueOf(captureMode)
+                cameraState = CameraXState(cameraProvider = cameraProvider,
+                    textureEntries = sensors.mapIndexed { index: Int, pigeonSensor: PigeonSensor ->
+                        (pigeonSensor.deviceId
+                            ?: index.toString()) to textureRegistry!!.createSurfaceTexture()
+                    }.toMap(),
+                    sensors = sensors,
+                    mirrorFrontCamera = mirrorFrontCamera,
+                    currentCaptureMode = mode,
+                    enableImageStream = enableImageStream,
+                    videoOptions = videoOptions?.android,
+                    videoRecordingQuality = videoOptions?.quality,
+                    onStreamReady = { state -> state.updateLifecycle(activity!!) }).apply {
+                    this.updateAspectRatio(aspectRatio)
+                    this.flashMode = FlashMode.valueOf(flashMode)
+                    this.enableAudioRecording = videoOptions?.enableAudio ?: true
+                }
+                this.exifPreferences = exifPreferences
+                orientationStreamListener =
+                    OrientationStreamListener(activity!!, listOf(sensorOrientationListener, cameraState))
+                imageStreamChannel.setStreamHandler(cameraState)
+                if (mode != CaptureModes.ANALYSIS_ONLY) {
+                    cameraState.updateLifecycle(activity!!)
+                    // Zoom should be set after updateLifeCycle
+                    if (zoom > 0) {
+                        // TODO Find a better way to set initial zoom than using a postDelayed
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            (cameraState.concurrentCamera?.cameras?.firstOrNull()
+                                ?: cameraState.previewCamera)?.cameraControl?.setLinearZoom(zoom.toFloat())
+                        }, 200)
+                    }
+                }
+
+                callback(Result.success(true))
+            } catch (e: Exception) {
+                callback(Result.failure(e))
+            }
+        }, ContextCompat.getMainExecutor(activity!!))
     }
 
     override fun checkPermissions(permissions: List<String>): List<String> {
@@ -574,8 +592,9 @@ class CameraAwesomeX : CameraInterface, FlutterPlugin, ActivityAware {
     }
 
     override fun stop(): Boolean {
+        pendingCameraProvider = null
         orientationStreamListener?.stop()
-        cameraState.stop()
+        if (::cameraState.isInitialized) cameraState.stop()
         return true
     }
 

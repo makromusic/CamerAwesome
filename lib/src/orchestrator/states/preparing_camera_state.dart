@@ -70,7 +70,7 @@ class PreparingCameraState extends CameraState {
       _permissionStreamSub =
           CamerawesomePlugin.listenPermissionResult()!.listen(
         (res) {
-          if (res && !_isReady) {
+          if (res && !_isReady && !_isInitializing) {
             _init(
               enableImageStream: enableImageStream,
               enablePhysicalButton: enablePhysicalButton,
@@ -179,6 +179,7 @@ class PreparingCameraState extends CameraState {
   }
 
   bool _isReady = false;
+  bool _isInitializing = false;
 
   // TODO Refactor this (make it stream providing state)
   Future<bool> _init({
@@ -190,6 +191,7 @@ class PreparingCameraState extends CameraState {
       enableImageStream: enableImageStream,
       enablePhysicalButton: enablePhysicalButton,
     );
+    _isInitializing = true;
     await CamerawesomePlugin.init(
       sensorConfig,
       enableImageStream,
@@ -198,7 +200,7 @@ class PreparingCameraState extends CameraState {
       exifPreferences: cameraContext.exifPreferences,
       videoOptions: saveConfig?.videoOptions,
       mirrorFrontCamera: saveConfig?.mirrorFrontCamera ?? false,
-    );
+    ).whenComplete(() => _isInitializing = false);
     _isReady = true;
     return _isReady;
   }
